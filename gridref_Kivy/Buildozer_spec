@@ -1,0 +1,31 @@
+[app]
+
+title = GridRef
+package.name = gridref
+package.domain = org.gridref
+
+source.dir = .
+source.include_exts = py,png,jpg,kv,atlas
+
+version = 1.0.0
+
+requirements = python3,kivy==2.3.0
+
+orientation = portrait
+fullscreen = 0
+
+icon.filename = %(source.dir)s/data/icon.png
+
+# ─── Android specifics ───────────────────────────────────────────────────
+
+android.permissions = INTERNET
+
+# Android 12 = API level 31. We target 33 (Android 13) as the compile/target
+# SDK per Google Play requirements, but set minapi to 31 so it runs on
+# Android 12 and up. Lower minapi if you need older device support.
+android.api = 33
+android.minapi = 31
+android.ndk = 25b
+android.archs = arm64-v8a, armeabi-v7a
+
+android.allow_backup = True
