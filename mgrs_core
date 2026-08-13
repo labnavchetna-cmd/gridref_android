@@ -1,0 +1,219 @@
+"""
+Core conversion logic for GridRef, extracted from the original CLI tool.
+No UI dependencies here - reusable by Kivy, CLI, or anything else.
+"""
+
+import re
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+import pure_mgrs as mgrs
+
+LATITUDE_MIN = -90.0
+LATITUDE_MAX = 90.0
+LONGITUDE_MIN = -180.0
+LONGITUDE_MAX = 180.0
+
+APP_NAME = "GridRef"
+APP_VERSION = "1.0.0"
+APP_TAGLINE = "Lat/Long -> MGRS Grid Reference Converter"
+
+
+class Precision(Enum):
+    """MGRS precision levels with human-readable metadata."""
+
+    SIX_FIGURE = (3, "6-figure", "~100m", "Area-level")
+    EIGHT_FIGURE = (4, "8-figure", "~10m", "Building-level")
+    TEN_FIGURE = (5, "10-figure", "~1m", "Pinpoint")
+
+    def __init__(self, mgrs_value: int, label: str, accuracy: str, description: str):
+        self.mgrs_value = mgrs_value
+        self.label = label
+        self.accuracy = accuracy
+        self.description = description
+
+
+@dataclass(frozen=True)
+class Coordinate:
+    """Validated geographic coordinate pair."""
+
+    latitude: float
+    longitude: float
+
+    def __post_init__(self):
+        if not (LATITUDE_MIN <= self.latitude <= LATITUDE_MAX):
+            raise ValueError(
+                f"Latitude must be between {LATITUDE_MIN} and {LATITUDE_MAX}, got {self.latitude}"
+            )
+        if not (LONGITUDE_MIN <= self.longitude <= LONGITUDE_MAX):
+            raise ValueError(
+                f"Longitude must be between {LONGITUDE_MIN} and {LONGITUDE_MAX}, got {self.longitude}"
+            )
+
+    @property
+    def hemisphere_ns(self) -> str:
+        return "N" if self.latitude >= 0 else "S"
+
+    @property
+    def hemisphere_ew(self) -> str:
+        return "E" if self.longitude >= 0 else "W"
+
+    @property
+    def display(self) -> str:
+        return (
+            f"{abs(self.latitude):.6f} deg {self.hemisphere_ns}, "
+            f"{abs(self.longitude):.6f} deg {self.hemisphere_ew}"
+        )
+
+
+@dataclass(frozen=True)
+class ConversionResult:
+    """Holds the full result of an MGRS conversion."""
+
+    coordinate: Coordinate
+    precision: Precision
+    mgrs_code: str
+    grid_zone: str
+    square_id: str
+    easting: str
+    northing: str
+
+    @property
+    def formatted(self) -> str:
+        return f"{self.grid_zone} {self.square_id} {self.easting} {self.northing}"
+
+
+class MGRSConverter:
+    """Handles the actual coordinate-to-MGRS conversion logic."""
+
+    def __init__(self):
+        self._engine = mgrs.MGRS()
+
+    def convert(self, coord: Coordinate, precision: Precision) -> ConversionResult:
+        """Convert a coordinate to MGRS at the specified precision."""
+        try:
+            raw = self._engine.toMGRS(
+                coord.latitude, coord.longitude, MGRSPrecision=precision.mgrs_value
+            )
+        except Exception as e:
+            raise ValueError(f"Conversion failed: {e}") from e
+
+        return self._parse_mgrs(raw, coord, precision)
+
+    @staticmethod
+    def _parse_mgrs(
+        raw: str, coord: Coordinate, precision: Precision
+    ) -> ConversionResult:
+        """Parse a raw MGRS string into its component parts.
+
+        MGRS format: GZD + 100km Square ID + Easting/Northing
+        Example: 43RGM 15980 67204
+        """
+        match = re.match(r"^(\d{1,2}[A-Z])([A-Z]{2})(\d+)$", raw)
+        if not match:
+            return ConversionResult(
+                coordinate=coord,
+                precision=precision,
+                mgrs_code=raw,
+                grid_zone=raw[:3] if len(raw) >= 3 else raw,
+                square_id=raw[3:5] if len(raw) >= 5 else "",
+                easting="",
+                northing="",
+            )
+
+        grid_zone = match.group(1)
+        square_id = match.group(2)
+        numeric = match.group(3)
+        half = len(numeric) // 2
+        easting = numeric[:half]
+        northing = numeric[half:]
+
+        return ConversionResult(
+            coordinate=coord,
+            precision=precision,
+            mgrs_code=raw,
+            grid_zone=grid_zone,
+            square_id=square_id,
+            easting=easting,
+            northing=northing,
+        )
+
+
+class InputParser:
+    """Parses and validates user input for coordinates."""
+
+    COMBINED_PATTERNS = [
+        # 28.6139, 77.2090
+        re.compile(r"^\s*(-?\d+\.?\d*)\s*[,\s]+\s*(-?\d+\.?\d*)\s*$"),
+        # 28.6139 N, 77.2090 E (with optional degree symbol/direction)
+        re.compile(
+            r"^\s*(-?\d+\.?\d*)\s*°?\s*([NSns])?\s*[,\s]+\s*(-?\d+\.?\d*)\s*°?\s*([EWew])?\s*$"
+        ),
+    ]
+
+    @classmethod
+    def try_parse_combined(cls, raw: str) -> Optional[Coordinate]:
+        """Attempt to parse a combined 'lat, long' string."""
+        raw = raw.strip()
+        if not raw:
+            return None
+
+        for pattern in cls.COMBINED_PATTERNS:
+            match = pattern.match(raw)
+            if not match:
+                continue
+            groups = match.groups()
+
+            if len(groups) == 2:
+                lat_str, lon_str = groups
+                lat_dir = lon_dir = None
+            else:
+                lat_str, lat_dir, lon_str, lon_dir = groups
+
+            try:
+                lat = float(lat_str)
+                lon = float(lon_str)
+            except (ValueError, TypeError):
+                continue
+
+            if lat_dir and lat_dir.upper() == "S":
+                lat = -abs(lat)
+            if lon_dir and lon_dir.upper() == "W":
+                lon = -abs(lon)
+
+            try:
+                return Coordinate(lat, lon)
+            except ValueError:
+                continue
+
+        return None
+
+    @staticmethod
+    def parse_float(raw: str, field_name: str, min_val: float, max_val: float) -> float:
+        """Parse and validate a single float value with direction-letter support."""
+        raw = raw.strip()
+        if not raw:
+            raise ValueError(f"{field_name} cannot be empty")
+
+        direction_match = re.match(r"^(-?\d+\.?\d*)\s*°?\s*([NSEWnsew])?$", raw)
+        if not direction_match:
+            raise ValueError(f"Could not parse {field_name}: '{raw}'")
+
+        value_str, direction = direction_match.groups()
+        try:
+            value = float(value_str)
+        except ValueError:
+            raise ValueError(f"Could not parse {field_name}: '{raw}'")
+
+        if direction:
+            direction = direction.upper()
+            if direction in ("S", "W"):
+                value = -abs(value)
+
+        if not (min_val <= value <= max_val):
+            raise ValueError(
+                f"{field_name} must be between {min_val} and {max_val}, got {value}"
+            )
+
+        return value
